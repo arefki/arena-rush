@@ -10,7 +10,7 @@
 //! in IDL order (see `target/idl/arena_rush.json`).
 
 use anchor_lang::AccountDeserialize;
-use arena_rush::{Arena, ID as PROGRAM_ID};
+use arena_rush::{Arena, PlayerStats, ID as PROGRAM_ID};
 use magicsvm::{MagicSVM, TransactionTarget};
 use solana_address::Address;
 use solana_clock::Clock;
@@ -51,6 +51,11 @@ pub fn reward_mint_auth_pda() -> (Address, u8) {
     Address::find_program_address(&[b"reward_mint_auth"], &PROGRAM_ADDRESS)
 }
 
+/// Player-stats (anti-replay ledger) PDA for a player (audit fix M-4).
+pub fn player_stats_pda(player: &Address) -> (Address, u8) {
+    Address::find_program_address(&[b"player_stats", player.as_ref()], &PROGRAM_ADDRESS)
+}
+
 /// Set up a fresh SVM with the program loaded and the payer funded.
 pub fn setup_svm() -> (MagicSVM, Keypair) {
     let mut svm = MagicSVM::new();
@@ -69,6 +74,18 @@ pub fn send_ix(
     payer: &Keypair,
     ix: Instruction,
 ) -> Result<(), String> {
+    send_ix_multi(svm, target, payer, &[], ix)
+}
+
+/// Send one instruction signed by the fee payer PLUS extra signers (e.g. a
+/// foreign player keypair for cross-player isolation tests).
+pub fn send_ix_multi(
+    svm: &mut MagicSVM,
+    target: TransactionTarget,
+    payer: &Keypair,
+    extra_signers: &[&Keypair],
+    ix: Instruction,
+) -> Result<(), String> {
     // Fresh blockhash per tx: MagicSVM/LiteSVM does NOT rotate the blockhash
     // on warp, so an identical retry (replay tap, force_expire after a clock
     // jump) would be deduped as AlreadyProcessed. Real slots rotate the
@@ -76,7 +93,9 @@ pub fn send_ix(
     svm.expire_blockhash_for(target);
     let blockhash: Hash = svm.latest_blockhash_for(target);
     let msg = Message::new_with_blockhash(&[ix], Some(&payer.pubkey()), &blockhash);
-    let tx = Transaction::new(&[payer], msg, blockhash);
+    let mut signers: Vec<&Keypair> = vec![payer];
+    signers.extend_from_slice(extra_signers);
+    let tx = Transaction::new(&signers, msg, blockhash);
     svm.send_transaction_to(target, tx)
         .map(|_| ())
         .map_err(|e| format!("{:?} | logs: {:?}", e.err, e.meta.logs))
@@ -103,6 +122,19 @@ pub fn read_arena(svm: &MagicSVM, target: TransactionTarget, arena: &Address) ->
         .expect("arena account exists");
     let mut data: &[u8] = &account.data;
     Arena::try_deserialize(&mut data).expect("arena deserializes")
+}
+
+/// Read and deserialize the PlayerStats account from a ledger.
+pub fn read_player_stats(
+    svm: &MagicSVM,
+    target: TransactionTarget,
+    stats: &Address,
+) -> PlayerStats {
+    let account = svm
+        .get_account_for(target, stats)
+        .expect("player_stats account exists");
+    let mut data: &[u8] = &account.data;
+    PlayerStats::try_deserialize(&mut data).expect("player_stats deserializes")
 }
 
 /// Read a token account balance (raw amount) from a ledger.

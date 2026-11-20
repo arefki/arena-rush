@@ -22,7 +22,9 @@ use ephemeral_rollups_sdk::ephem::MagicIntentBundleBuilder;
 use ephemeral_rollups_sdk::vrf::{
     self,
     consts::{program_identity_pubkey, scoped_vrf_identity_const},
-    instructions::{create_request_randomness_ix_const, RequestRandomnessParams},
+    instructions::{
+        create_request_high_priority_scoped_randomness_ix_const, RequestRandomnessParams,
+    },
     types::SerializableAccountMeta,
 };
 
@@ -45,6 +47,9 @@ const SCOPED_VRF_IDENTITY: Pubkey =
 pub const ARENA_SEED: &[u8] = b"arena";
 pub const REWARD_MINT_SEED: &[u8] = b"reward_mint";
 pub const REWARD_MINT_AUTH_SEED: &[u8] = b"reward_mint_auth";
+/// Anti-replay ledger seed (audit fix M-4): the player_stats PDA is NEVER
+/// delegated, so it survives any undelegation snapshot revert.
+pub const PLAYER_STATS_SEED: &[u8] = b"player_stats";
 
 /// Round states.
 pub const STATE_IDLE: u8 = 0; // created, not playing
@@ -105,7 +110,25 @@ pub mod arena_rush {
     }
 
     /// Delegate the arena PDA to the ER (base-layer tx).
+    ///
+    /// Audit fix H-1: the arena must be IDLE or CLAIMED. A RESOLVED round
+    /// re-delegated here would be bricked forever — `claim_reward` needs
+    /// the arena on base, and `start_round` needs IDLE|CLAIMED, so the
+    /// reward could never be claimed. The guard deserializes the raw
+    /// AccountInfo because the `#[delegate]` macro requires it.
     pub fn delegate(ctx: Context<DelegateArena>) -> Result<()> {
+        // The data borrow MUST drop before the delegate CPI: the CPI
+        // borrows the same account mutably, and a live Ref fails with
+        // AccountBorrowFailed (caught by MagicSVM test run 1).
+        let state = {
+            let arena_data = ctx.accounts.arena.data.borrow();
+            let mut arena_bytes: &[u8] = &arena_data;
+            Arena::try_deserialize(&mut arena_bytes)?.state
+        };
+        require!(
+            state == STATE_IDLE || state == STATE_CLAIMED,
+            ArenaError::CannotDelegateUnclaimed
+        );
         ctx.accounts.delegate_arena(
             &ctx.accounts.player,
             &[ARENA_SEED, ctx.accounts.player.key().as_ref()],
@@ -133,7 +156,12 @@ pub mod arena_rush {
         arena.last_target_id = NO_TARGET;
         arena.round_start_ts = now;
         arena.vrf_request_ts = 0;
-        arena.round_nonce = arena.round_nonce.saturating_add(1);
+        // Audit fix L-5: checked_add — a saturating nonce would let two
+        // rounds share a nonce (and a caller_seed) at u64::MAX.
+        arena.round_nonce = arena
+            .round_nonce
+            .checked_add(1)
+            .ok_or(ArenaError::NonceOverflow)?;
         Ok(())
     }
 
@@ -178,12 +206,20 @@ pub mod arena_rush {
         arena.vrf_request_ts = Clock::get()?.unix_timestamp;
         let round_nonce = arena.round_nonce;
 
-        // Caller seed: round nonce in the first 8 bytes (binds the request
-        // to this round; the callback re-checks the nonce). round_nonce is
-        // monotonic and never resets, so seeds never collide across rounds
-        // or re-delegations.
+        // Caller seed (audit fix M-3): fill all 32 bytes deterministically
+        // and uniquely per player + arena + round — player bytes [0..8],
+        // arena bytes [0..8], round nonce, player bytes [8..16]. The old
+        // seed used only the round nonce, so every player shared identical
+        // seeds per round number. NOTE (audit M-2): this does NOT
+        // cryptographically bind the request to its origin — any VRF
+        // request bound to this arena+nonce can still resolve the round;
+        // the outcome stays oracle-uniform either way.
         let mut caller_seed = [0u8; 32];
-        caller_seed[..8].copy_from_slice(&round_nonce.to_le_bytes());
+        let player_key = ctx.accounts.player.key();
+        caller_seed[0..8].copy_from_slice(&player_key.as_ref()[0..8]);
+        caller_seed[8..16].copy_from_slice(&arena_key.as_ref()[0..8]);
+        caller_seed[16..24].copy_from_slice(&round_nonce.to_le_bytes());
+        caller_seed[24..32].copy_from_slice(&player_key.as_ref()[8..16]);
 
         let params = RequestRandomnessParams {
             payer: ctx.accounts.player.key(),
@@ -199,7 +235,10 @@ pub mod arena_rush {
             callback_args: Some(round_nonce.to_le_bytes().to_vec()),
             ..Default::default()
         };
-        let ix = create_request_randomness_ix_const(params, PROGRAM_IDENTITY);
+        // Audit fix L-7: high-priority VRF request (discriminator 11) so
+        // the callback lands in ~3 ER slots instead of queueing behind
+        // regular-priority requests.
+        let ix = create_request_high_priority_scoped_randomness_ix_const(params, PROGRAM_IDENTITY);
         ctx.accounts
             .invoke_signed_vrf(&ctx.accounts.player.to_account_info(), &ix)?;
         Ok(())
@@ -237,10 +276,13 @@ pub mod arena_rush {
     }
 
     /// Timeout recovery: if the VRF callback never arrives (request TTL
-    /// ~120 s, no refund), the player can resolve the round after 130 s
-    /// with the fallback Common multiplier (x1) instead of staying stuck in
-    /// ROLLING forever. A late real callback afterwards is rejected (state
-    /// is RESOLVED, not ROLLING). Player-only: the round is theirs.
+    /// ~120 s, no refund), the round can be resolved after 130 s with the
+    /// fallback Common multiplier (x1) instead of staying stuck in ROLLING
+    /// forever. A late real callback afterwards is rejected (state is
+    /// RESOLVED, not ROLLING). Audit fix M-1: PERMISSIONLESS — anyone may
+    /// call it (the caller pays gas); the arena PDA seeds bind it to the
+    /// player, so no one else's round can be touched. An abandoned ROLLING
+    /// arena no longer locks forever.
     pub fn force_expire(ctx: Context<ForceExpire>) -> Result<()> {
         let arena = &mut ctx.accounts.arena;
         require!(arena.state == STATE_ROLLING, ArenaError::NotRolling);
@@ -276,13 +318,27 @@ pub mod arena_rush {
     /// (decimals 0) to the player's ATA. State flips to CLAIMED before the
     /// mint CPI (and the whole ix is atomic), so a second claim tx always
     /// sees CLAIMED.
+    ///
+    /// Audit fix M-4 (hardening): the claim is also recorded in the
+    /// never-delegated `player_stats` PDA (`last_claimed_nonce`), so even
+    /// if an undelegation ever reverted the base arena snapshot to
+    /// RESOLVED, the round could not be claimed twice.
     pub fn claim_reward(ctx: Context<ClaimReward>) -> Result<()> {
         let arena = &mut ctx.accounts.arena;
         require!(arena.state == STATE_RESOLVED, ArenaError::NotResolved);
+        require!(
+            arena.round_nonce > ctx.accounts.player_stats.last_claimed_nonce,
+            ArenaError::RoundAlreadyClaimed
+        );
         let amount = (arena.score as u64)
             .saturating_mul(arena.multiplier as u64)
             .min(MAX_REWARD);
+        let round_nonce = arena.round_nonce;
         arena.state = STATE_CLAIMED;
+        let stats = &mut ctx.accounts.player_stats;
+        stats.last_claimed_nonce = round_nonce;
+        stats.total_minted = stats.total_minted.saturating_add(amount);
+        stats.bump = ctx.bumps.player_stats;
 
         let auth_seeds: &[&[u8]] = &[
             REWARD_MINT_AUTH_SEED,
@@ -331,7 +387,10 @@ pub struct InitRewardMint<'info> {
         bump,
         mint::decimals = 0,
         mint::authority = mint_authority,
-        mint::freeze_authority = mint_authority,
+        // Audit fix L-4: NO freeze authority (omitted = None). No
+        // instruction ever freezes RUSH; a live freeze authority was a
+        // dormant privilege. (The live devnet mint keeps its existing
+        // freeze authority — mint fields are immutable after creation.)
     )]
     pub reward_mint: Account<'info, Mint>,
     /// CHECK: PDA mint authority; only used as a CPI signer via seeds.
@@ -402,9 +461,15 @@ pub struct VrfCallback<'info> {
 
 #[derive(Accounts)]
 pub struct ForceExpire<'info> {
-    #[account(mut, seeds = [ARENA_SEED, player.key().as_ref()], bump = arena.bump, has_one = player)]
+    // Audit fix M-1: permissionless — the arena PDA seeds bind it to the
+    // player pubkey, so no has_one / player-signer is needed. `player` is
+    // read-only and used only for seeds derivation; `caller` is any signer
+    // who pays gas.
+    #[account(mut, seeds = [ARENA_SEED, player.key().as_ref()], bump = arena.bump)]
     pub arena: Account<'info, Arena>,
-    pub player: Signer<'info>,
+    /// CHECK: Player pubkey, read-only, used only to derive the arena PDA.
+    pub player: UncheckedAccount<'info>,
+    pub caller: Signer<'info>,
 }
 
 #[commit]
@@ -437,6 +502,28 @@ pub struct ClaimReward<'info> {
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+    /// Audit fix M-4: anti-replay ledger. Created lazily on first claim;
+    /// NEVER delegated, so it survives any undelegation snapshot revert.
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + PlayerStats::INIT_SPACE,
+        seeds = [PLAYER_STATS_SEED, player.key().as_ref()],
+        bump
+    )]
+    pub player_stats: Account<'info, PlayerStats>,
+}
+
+/// Per-player claim ledger (audit fix M-4). Never delegated: it lives on
+/// base only and records the highest claimed round nonce, so a round can
+/// never be claimed twice even if the base arena snapshot reverts.
+#[account]
+#[derive(InitSpace)]
+pub struct PlayerStats {
+    pub last_claimed_nonce: u64, // 8 — highest round_nonce claimed so far
+    pub total_minted: u64,       // 8 — lifetime RUSH minted to this player
+    pub bump: u8,                // 1
+    // Total: 17 bytes + 8 discriminator = 25 bytes.
 }
 
 #[account]
@@ -478,4 +565,12 @@ pub enum ArenaError {
     RoundTimeExpired,
     #[msg("VRF request has not expired yet")]
     VrfNotExpired,
+    // --- Audit-fix errors (appended at the END so existing codes 6000-6008
+    // never shift; clients pin these codes in tests). ---
+    #[msg("Arena must be IDLE or CLAIMED to delegate")]
+    CannotDelegateUnclaimed, // 6009 (H-1)
+    #[msg("This round has already been claimed")]
+    RoundAlreadyClaimed, // 6010 (M-4)
+    #[msg("Round nonce overflow")]
+    NonceOverflow, // 6011 (L-5)
 }

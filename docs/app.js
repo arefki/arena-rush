@@ -48,9 +48,9 @@ const baseConn = new Connection(BASE_RPC, "confirmed");
 let erConn = new Connection(DEFAULT_ER, "confirmed");
 let wallet = null;          // { publicKey, signTransaction(tx) }
 let demoMode = false;
-let pdas = null;            // { arena, mint, auth, buffer, record, metadata, identity, ata }
+let pdas = null;            // { arena, mint, auth, buffer, record, metadata, identity, ata, stats }
 let arenaState = null;      // decoded arena account (latest poll)
-let proofs = [];            // { label, sig, chain } for the results screen
+let lobbyAction = "enter";  // H-2: enter | claim | commit-claim | resume | check-vrf
 let roundTimer = null, pollTimer = null;
 let lastTargetId = 0xffff, pendingTaps = 0, confirmedTaps = 0;
 let roundActive = false, endingRound = false;
@@ -68,14 +68,27 @@ function log(el, msg, cls) {
 }
 const logLobby = (m, c) => log($("lobby-log"), m, c);
 const logChest = (m, c) => log($("chest-log"), m, c);
+// L-1: escape untrusted strings (RPC/wallet error text) before they reach
+// innerHTML — the log templates themselves are trusted static HTML.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 function showScreen(id) {
   for (const s of document.querySelectorAll(".screen")) s.classList.remove("active");
   $(id).classList.add("active");
 }
 function addProof(label, sig) {
-  proofs.push({ label, sig });
+  // L-1/L-8: DOM-node construction (no innerHTML sink); the `proofs` array
+  // is gone — rendering is DOM-only, nothing ever read it back.
   const li = document.createElement("li");
-  li.innerHTML = `<b>${label}</b><br><a href="${explorerTx(sig)}" target="_blank" rel="noopener">${sig}</a>`;
+  const b = document.createElement("b");
+  b.textContent = label;
+  const a = document.createElement("a");
+  a.href = explorerTx(sig);
+  a.target = "_blank"; a.rel = "noopener";
+  a.textContent = sig;
+  li.append(b, document.createElement("br"), a);
   $("proof-links").appendChild(li);
 }
 async function findPda(seeds, programId) {
@@ -94,7 +107,9 @@ async function computePdas(player) {
   const identity = await findPda([new TextEncoder().encode("identity")], PROGRAM_ID);
   const ata = await findPda([player.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
                             ASSOCIATED_TOKEN_PROGRAM_ID);
-  return { arena, mint, auth, buffer, record, metadata, identity, ata };
+  // M-4: anti-replay ledger PDA (never delegated, lives on base only).
+  const stats = await findPda([new TextEncoder().encode("player_stats"), player.toBuffer()], PROGRAM_ID);
+  return { arena, mint, auth, buffer, record, metadata, identity, ata, stats };
 }
 
 // Arena layout (94 bytes): disc 8 | player 32 | score u32 | state u8 |
@@ -154,14 +169,18 @@ function ixEndRound(player) {
   return ix("end_round", [sgw(player), rw(pdas.arena), rw(EPHEMERAL_QUEUE),
     ro(pdas.identity), ro(VRF_PROGRAM_ID), ro(SLOT_HASHES), ro(SystemProgram.programId)]);
 }
-function ixForceExpire(player) { return ix("force_expire", [rw(pdas.arena), sg(player)]); }
+// M-1: force_expire is permissionless — [arena, player (read-only, seeds
+// only), caller (signer)]. Self-use passes the wallet as both.
+function ixForceExpire(player) { return ix("force_expire", [rw(pdas.arena), ro(player), sg(player)]); }
 function ixCommit(player) {
   return ix("commit_and_undelegate", [sgw(player), rw(pdas.arena),
     ro(MAGIC_PROGRAM_ID), rw(MAGIC_CONTEXT_ID)]);
 }
 function ixClaim(player) {
+  // M-4: player_stats ledger appended (last account in IDL order).
   return ix("claim_reward", [rw(pdas.arena), sgw(player), rw(pdas.mint), ro(pdas.auth),
-    rw(pdas.ata), ro(TOKEN_PROGRAM_ID), ro(ASSOCIATED_TOKEN_PROGRAM_ID), ro(SystemProgram.programId)]);
+    rw(pdas.ata), ro(TOKEN_PROGRAM_ID), ro(ASSOCIATED_TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
+    rw(pdas.stats)]);
 }
 
 // ---------- send helpers ----------
@@ -286,22 +305,62 @@ async function afterConnect() {
   pdas = await computePdas(wallet.publicKey);
   await refreshErEndpoint();
   try { await refreshLobby(); }
-  catch (e) { logLobby("Lobby refresh failed (RPC unreachable?): " + (e.message || e), "err"); }
+  catch (e) { logLobby("Lobby refresh failed (RPC unreachable?): " + esc(e.message || e), "err"); }
 }
+// H-2: lobby state dispatch — after a reload the lobby reads the LIVE arena
+// state (ER copy when delegated — the base copy is a stale snapshot while
+// delegated) and routes the action button to the right recovery path instead
+// of always offering a fresh "Enter".
 async function refreshLobby() {
   try {
     const bal = await baseConn.getBalance(wallet.publicKey);
     $("sol-balance").textContent = (bal / 1e9).toFixed(4) + " SOL";
   } catch (e) { $("sol-balance").textContent = "— (RPC error)"; }
   const st = await getDelegationStatus(pdas.arena);
-  $("delegated-state").textContent = st && (st.isDelegated ?? st.delegated) ? "yes — " + st.fqdn : "no";
-  arenaState = await fetchArena(baseConn);
+  const delegated = !!(st && (st.isDelegated ?? st.delegated));
+  $("delegated-state").textContent = delegated ? "yes — " + st.fqdn : "no";
+  arenaState = delegated ? await fetchArena(erConn) : await fetchArena(baseConn);
+  if (!arenaState && delegated) arenaState = await fetchArena(baseConn); // ER read fallback
+  const btn = $("btn-enter");
   if (!arenaState) {
     $("arena-state").textContent = "not created yet";
     $("best-score").textContent = "—";
+    lobbyAction = "enter";
+    btn.textContent = "Enter the Arena";
   } else {
-    $("arena-state").textContent = STATE_NAMES[arenaState.state] + " (round " + arenaState.roundNonce + ")";
+    // L-6: guard the STATE_NAMES fallthrough (unknown state byte → UNKNOWN).
+    $("arena-state").textContent = (STATE_NAMES[arenaState.state] ?? "UNKNOWN")
+      + " (round " + arenaState.roundNonce + ")";
     $("best-score").textContent = arenaState.bestScore;
+    switch (arenaState.state) {
+      case 0: case 4: // IDLE / CLAIMED — fresh round
+        lobbyAction = "enter";
+        btn.textContent = "Enter the Arena";
+        break;
+      case 1: { // PLAYING — resume with the remaining time
+        lobbyAction = "resume";
+        const left = Math.max(0, ROUND_SECONDS - (Date.now() / 1000 - Number(arenaState.roundStartTs)));
+        btn.textContent = "Resume round (" + left.toFixed(0) + "s left)";
+        break;
+      }
+      case 2: // ROLLING — VRF pending, check status / force-expire if expired
+        lobbyAction = "check-vrf";
+        btn.textContent = "Check VRF status";
+        break;
+      case 3: // RESOLVED — claim, never re-delegate (H-1)
+        if (delegated) {
+          lobbyAction = "commit-claim";
+          btn.textContent = "Commit & Claim";
+        } else {
+          lobbyAction = "claim";
+          const reward = Math.min(arenaState.score * arenaState.multiplier, MAX_REWARD);
+          btn.textContent = "Claim " + reward + " RUSH";
+        }
+        break;
+      default:
+        lobbyAction = "enter";
+        btn.textContent = "Enter the Arena";
+    }
   }
   const ata = await baseConn.getAccountInfo(pdas.ata);
   if (ata) {
@@ -310,9 +369,82 @@ async function refreshLobby() {
   } else $("rush-balance").textContent = "0 RUSH";
 }
 
+// ---------- lobby recovery paths (H-2) ----------
+// RESOLVED + not delegated: claim straight from the lobby.
+async function claimFromLobby() {
+  const player = wallet.publicKey;
+  const baseState = await fetchArena(baseConn);
+  if (!baseState || baseState.state !== 3) {
+    logLobby("Nothing to claim — the round is not RESOLVED on base.", "err");
+    await refreshLobby();
+    return;
+  }
+  logLobby("Claiming your RUSH reward on base…");
+  const claimSig = await sendAndConfirm(baseConn, ixClaim(player), "claim_reward");
+  logLobby(`Claimed! <a href="${explorerTx(claimSig)}" target="_blank" rel="noopener">view tx</a>`, "ok");
+  addProof("claim_reward (base)", claimSig);
+  const reward = Math.min(baseState.score * baseState.multiplier, MAX_REWARD);
+  $("res-score").textContent = baseState.score;
+  $("res-mult").textContent = "×" + baseState.multiplier;
+  $("res-rush").textContent = reward + " RUSH";
+  $("res-best").textContent = baseState.bestScore;
+  showScreen("screen-results");
+}
+// RESOLVED + delegated: settle via the chest screen, then claim.
+async function commitClaimFromLobby() {
+  $("chest-title").textContent = "Settling your resolved round…";
+  $("chest-sub").textContent = "Committing the resolved state back to base, then claiming your RUSH.";
+  $("chest-result").classList.add("hidden");
+  showScreen("screen-chest");
+  await commitAndClaim();
+}
+// PLAYING: re-enter the round with the remaining time and the chain score.
+async function resumeRound() {
+  const st = await fetchArena(erConn);
+  if (!st || st.state !== 1) {
+    logLobby("Round is no longer PLAYING — refreshing…", "err");
+    await refreshLobby();
+    return;
+  }
+  const remaining = ROUND_SECONDS - (Date.now() / 1000 - Number(st.roundStartTs));
+  arenaState = st;
+  $("round-nonce").textContent = st.roundNonce.toString();
+  if (remaining <= 0) {
+    logLobby("Round time is up — ending the round…");
+    endRound();
+    return;
+  }
+  logLobby("Resuming round — " + remaining.toFixed(0) + "s left, score " + st.score + ".");
+  beginPlay(remaining, st.score);
+}
+// ROLLING: watch the VRF resolution from the chest screen.
+function checkVrfFromLobby() {
+  $("chest-title").textContent = "🎲 Checking your VRF roll…";
+  $("chest-sub").textContent = "Your round ended and the VRF oracle is resolving the loot multiplier. This usually takes a few seconds.";
+  $("chest-result").classList.add("hidden");
+  $("btn-force-expire").classList.add("hidden");
+  showScreen("screen-chest");
+  pollForResolved();
+}
+
 // ---------- game flow ----------
+// H-2: the lobby button routes by live arena state (see refreshLobby).
 async function onEnterArena() {
   $("btn-enter").disabled = true;
+  try {
+    switch (lobbyAction) {
+      case "claim": await claimFromLobby(); break;
+      case "commit-claim": await commitClaimFromLobby(); break;
+      case "resume": await resumeRound(); break;
+      case "check-vrf": checkVrfFromLobby(); break;
+      default: await enterArenaFresh(); break;
+    }
+  } catch (e) {
+    logLobby("Error: " + esc(e.message || e), "err");
+    $("btn-enter").disabled = false;
+  }
+}
+async function enterArenaFresh() {
   const player = wallet.publicKey;
   try {
     // 1. Reward mint (one-time, permissionless — safe to call if missing).
@@ -332,6 +464,14 @@ async function onEnterArena() {
     // Live router field is `isDelegated` (not `delegated`).
     const st = await getDelegationStatus(pdas.arena);
     if (!st || !(st.isDelegated ?? st.delegated)) {
+      // H-1: a RESOLVED round routes to claim, NEVER to re-delegate (the
+      // program guard would reject it anyway — this keeps the UX honest).
+      const fresh = await fetchArena(baseConn);
+      if (fresh && fresh.state === 3) {
+        logLobby("Round already resolved — routing to claim instead of re-delegating.");
+        await claimFromLobby();
+        return;
+      }
       logLobby("Delegating arena to the Ephemeral Rollup…");
       const sig = await sendAndConfirm(baseConn, ixDelegate(player), "delegate");
       logLobby(`Delegated. <a href="${explorerTx(sig)}" target="_blank" rel="noopener">view tx</a>`, "ok");
@@ -342,27 +482,45 @@ async function onEnterArena() {
     }
     // 4. Start the round on the ER.
     logLobby("Starting round on the ER…");
-    const sig = await sendAndConfirm(erConn, ixStartRound(player), "start_round");
+    let sig;
+    try {
+      sig = await sendAndConfirm(erConn, ixStartRound(player), "start_round");
+    } catch (e) {
+      // H-2 recovery: the arena may have been undelegated (or never
+      // delegated) — re-poll the router once and re-delegate if needed,
+      // then retry start_round once before surfacing the error.
+      logLobby("start_round failed — re-checking delegation…");
+      const st2 = await getDelegationStatus(pdas.arena);
+      if (!st2 || !(st2.isDelegated ?? st2.delegated)) {
+        logLobby("Arena not delegated — re-delegating once…");
+        const dsig = await sendAndConfirm(baseConn, ixDelegate(player), "delegate");
+        logLobby(`Re-delegated. <a href="${explorerTx(dsig)}" target="_blank" rel="noopener">view tx</a>`, "ok");
+        addProof("delegate (base, retry)", dsig);
+        await refreshErEndpoint();
+        sig = await sendAndConfirm(erConn, ixStartRound(player), "start_round");
+      } else { throw e; }
+    }
     logLobby(`Round started. <a href="${explorerTx(sig)}" target="_blank" rel="noopener">view tx</a>`, "ok");
     addProof("start_round (ER)", sig);
     arenaState = await fetchArena(erConn);
     $("round-nonce").textContent = arenaState ? arenaState.roundNonce.toString() : "—";
     beginPlay();
   } catch (e) {
-    logLobby("Error: " + (e.message || e), "err");
+    logLobby("Error: " + esc(e.message || e), "err");
     $("btn-enter").disabled = false;
   }
 }
-function beginPlay() {
+// remaining/startScore support the H-2 resume path (fresh rounds use defaults).
+function beginPlay(remaining = ROUND_SECONDS, startScore = 0) {
   roundActive = true; endingRound = false;
-  confirmedTaps = 0; pendingTaps = 0; updateTapCounts();
-  $("score").textContent = "0";
+  confirmedTaps = startScore; pendingTaps = 0; updateTapCounts();
+  $("score").textContent = String(startScore);
   showScreen("screen-arena");
   spawnTarget();
   const t0 = Date.now();
   clearInterval(roundTimer);
   roundTimer = setInterval(() => {
-    const left = ROUND_SECONDS - (Date.now() - t0) / 1000;
+    const left = remaining - (Date.now() - t0) / 1000;
     $("timer").textContent = Math.max(0, left).toFixed(1);
     if (left <= 0) { clearInterval(roundTimer); endRound(); }
   }, 100);
@@ -410,23 +568,40 @@ async function endRound() {
     addProof("end_round / VRF request (ER)", sig);
     pollForResolved();
   } catch (e) {
-    logChest("end_round failed: " + (e.message || e), "err");
+    logChest("end_round failed: " + esc(e.message || e), "err");
     $("chest-title").textContent = "Something went wrong — check the log.";
   }
 }
+// M-5: the poll now CAPS (~160 s — covers the 130 s VRF timeout + margin),
+// reconciles the optimistic tap score from chain state on every tick, and
+// ends in a visible manual-resolution state instead of spinning forever.
 async function pollForResolved() {
   clearInterval(pollTimer);
+  let polls = 0;
+  const MAX_POLLS = 200;
   pollTimer = setInterval(async () => {
     try {
       const st = await fetchArena(erConn);
       if (!st) return;
       arenaState = st;
+      confirmedTaps = st.score;
+      $("score").textContent = String(st.score);
+      updateTapCounts();
       if (st.state === 3) {           // RESOLVED — VRF callback landed
         clearInterval(pollTimer);
         revealChest(st);
-      } else if (st.state === 2) {    // ROLLING
+        return;
+      }
+      if (st.state === 2) {    // ROLLING
         const age = Date.now() / 1000 - Number(st.vrfRequestTs);
         if (age > VRF_TIMEOUT_S) $("btn-force-expire").classList.remove("hidden");
+      }
+      if (++polls >= MAX_POLLS) {
+        clearInterval(pollTimer);
+        $("chest-title").textContent = "Still waiting for the VRF oracle…";
+        $("chest-sub").textContent = "The round is still pending. You can resolve it manually as Common ×1 (once 130 s have passed) or reload and check again from the lobby.";
+        $("btn-force-expire").classList.remove("hidden");
+        logChest("VRF poll gave up after ~160 s — round still pending. Use force-expire (after 130 s) or retry from the lobby.", "err");
       }
     } catch (e) { console.warn("poll:", e); }
   }, 800);
@@ -450,7 +625,16 @@ async function onForceExpire() {
     const sig = await sendAndConfirm(erConn, ixForceExpire(wallet.publicKey), "force_expire");
     logChest(`Force-expired (Common ×1 fallback). <a href="${explorerTx(sig)}" target="_blank" rel="noopener">view tx</a>`, "ok");
     addProof("force_expire (ER)", sig);
-  } catch (e) { logChest("force_expire failed: " + (e.message || e), "err"); }
+  } catch (e) {
+    // M-5: never leave the button dead — re-enable with a clear message.
+    // VrfNotExpired is custom program error 0x1778 (6008).
+    const msg = e.message || String(e);
+    const notExpired = msg.includes("0x1778") || msg.includes("6008")
+      || msg.toLowerCase().includes("not expired");
+    logChest("force_expire failed: " + esc(msg)
+      + (notExpired ? " — the 130 s VRF timeout has not passed yet on-chain. Wait a bit and try again." : ""), "err");
+    $("btn-force-expire").disabled = false;
+  }
 }
 async function commitAndClaim() {
   const player = wallet.publicKey;
@@ -483,7 +667,7 @@ async function commitAndClaim() {
     const baseState = await fetchArena(baseConn);
     if (!baseState || baseState.state !== 3) {
       logChest("Base state not RESOLVED after commit — check explorer. state="
-        + (baseState ? STATE_NAMES[baseState.state] : "missing"), "err");
+        + (baseState ? (STATE_NAMES[baseState.state] ?? "UNKNOWN") : "missing"), "err");
       return;
     }
     logChest("Claiming RUSH reward on base…");
@@ -497,7 +681,7 @@ async function commitAndClaim() {
     $("res-best").textContent = baseState.bestScore;
     showScreen("screen-results");
   } catch (e) {
-    logChest("commit/claim failed: " + (e.message || e), "err");
+    logChest("commit/claim failed: " + esc(e.message || e), "err");
   }
 }
 
@@ -512,12 +696,12 @@ $("target").addEventListener("click", onTap);
 $("tap-area").addEventListener("click", (e) => { if (e.target.id === "tap-area") burst(e.offsetX, e.offsetY); });
 $("btn-force-expire").addEventListener("click", onForceExpire);
 $("btn-again").addEventListener("click", async () => {
-  proofs = []; $("proof-links").innerHTML = "";
+  $("proof-links").innerHTML = "";
   showScreen("screen-lobby"); await refreshLobby();
   $("btn-enter").disabled = false; onEnterArena();
 });
 $("btn-lobby").addEventListener("click", async () => {
-  proofs = []; $("proof-links").innerHTML = "";
+  $("proof-links").innerHTML = "";
   showScreen("screen-lobby"); await refreshLobby();
   $("btn-enter").disabled = false;
 });

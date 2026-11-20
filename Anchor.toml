@@ -15,4 +15,7 @@ cluster = "Devnet"
 wallet = "~/workspace/solana-blitz-v10/deploy-keypair.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+# L-3: the real suite is the Rust MagicSVM tests (no TS suite exists).
+# Runs under +stable: the workspace 1.89.0 toolchain cannot compile
+# solana-syscalls 4.2.2 (see BUILD.md §5).
+test = "cargo +stable test -p arena-rush-magicsvm-tests"
