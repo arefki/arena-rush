@@ -1,0 +1,40 @@
+[package]
+name = "arena-rush-magicsvm-tests"
+version = "0.1.0"
+edition = "2021"
+
+# MagicSVM 0.3.0 in-process tests: base + ephemeral ledgers, VRF callbacks.
+# Run with: cargo +stable test -p arena-rush-magicsvm-tests
+# (stable = rustc 1.100; the workspace 1.89.0 pin CANNOT compile
+# solana-syscalls 4.2.2, which needs MaybeUninit::write_slice, stable
+# since Rust 1.90. Needs the compiled program at
+# ../target/deploy/arena_rush.so first: run `anchor-1.0.2 build` from
+# the workspace root before testing.)
+#
+# Version notes: magicsvm pins the solana split crates to narrow ranges
+# (solana-address ~2.6.1, solana-instruction ~3.4.0, solana-signature ~3.4.1,
+# solana-hash ~4.5.0, solana-clock ~3.1.1, solana-transaction-error ~3.3.1).
+# The workspace lock is pinned to those exact versions so the Instruction /
+# Address / Hash types unify between the program crate (anchor-lang 1.0.2)
+# and magicsvm — otherwise the two sides see different types for the same
+# on-chain data and nothing compiles.
+
+[dependencies]
+magicsvm = "=0.3.0"
+arena-rush = { path = "../programs/arena-rush", features = ["cpi"] }
+anchor-lang = "=1.0.2"
+solana-address = "~2.6.1"
+solana-clock = "~3.1.1"
+solana-hash = "~4.5.0"
+solana-instruction = "~3.4.0"
+solana-keypair = "3.1.2"
+solana-message = "4.2.4"
+solana-signature = "~3.4.1"
+solana-signer = "3.0.1"
+solana-sysvar = "4.1.0"
+solana-system-interface = "3.2.0"
+solana-transaction = "4.1.5"
+solana-transaction-error = "~3.3.1"
+
+[dev-dependencies]
+# (integration tests live in tests/ and use the same deps)

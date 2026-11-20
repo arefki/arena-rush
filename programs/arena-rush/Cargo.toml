@@ -1,0 +1,25 @@
+[package]
+name = "arena-rush"
+version = "0.1.0"
+description = "Arena Rush — Solana Blitz v10 entry: real-time reflex game on MagicBlock Ephemeral Rollups + Solana VRF"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "arena_rush"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+default = []
+
+[dependencies]
+# Exact pins: "1.0.2" alone resolves to anchor-lang 1.2.2 (latest 1.x),
+# which pulls solana-program 4.0 and breaks the SDK 0.18 #[vrf] macro
+# (E0433: cannot find slot_hashes in sysvar). The SDK's tested line is 1.0.2.
+anchor-lang = { version = "=1.0.2", features = ["init-if-needed"] }
+anchor-spl = { version = "=1.0.2" }
+ephemeral-rollups-sdk = { version = "=0.18.0", features = ["anchor", "vrf"] }

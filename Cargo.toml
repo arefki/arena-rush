@@ -1,0 +1,6 @@
+[workspace]
+members = ["programs/*", "tests-magicsvm-rs"]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true

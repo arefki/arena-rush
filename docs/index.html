@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<title>Arena Rush — Solana Blitz v10</title>
+<link rel="stylesheet" href="./styles.css">
+<script src="./vendor/web3.iife.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">⚡ ARENA RUSH</div>
+  <div class="sub">Solana Blitz v10 · MagicBlock Ephemeral Rollups + Solana VRF · <b>DEVNET ONLY</b></div>
+  <div id="wallet-bar">
+    <span id="wallet-status">Not connected</span>
+    <button id="btn-connect" class="btn">Connect Phantom</button>
+    <button id="btn-demo" class="btn ghost" title="Localhost only: loads demo-keypair.json from this folder (devnet-only throwaway keypair, never committed)">Demo wallet (localhost)</button>
+    <label class="btn ghost file-btn">Load keypair file…
+      <input type="file" id="file-keypair" accept=".json,application/json" hidden>
+    </label>
+  </div>
+  <div id="demo-banner" class="banner hidden">🎬 DEMO WALLET MODE — devnet only, throwaway keypair. Never use a real wallet here.</div>
+</header>
+
+<main>
+  <!-- ============ SCREEN 1: LOBBY ============ -->
+  <section id="screen-lobby" class="screen active">
+    <h1>Tap fast. Win RUSH.</h1>
+    <p class="lede">A 30-second reflex duel that only exists because the Ephemeral Rollup runs
+    10&nbsp;ms blocks — every tap is a gasless on-chain transaction. Round end rolls a
+    verifiable loot chest (Solana VRF): Common ×1 to Legendary ×5.</p>
+    <div class="how">
+      <div class="step"><b>1</b> Delegate your arena to the rollup</div>
+      <div class="step"><b>2</b> Tap targets for 30 s — gasless, instant</div>
+      <div class="step"><b>3</b> VRF loot chest multiplies your score</div>
+      <div class="step"><b>4</b> Commit back &amp; claim RUSH tokens</div>
+    </div>
+    <div class="status-grid">
+      <div>Wallet SOL (devnet): <b id="sol-balance">—</b></div>
+      <div>Arena: <b id="arena-state">—</b></div>
+      <div>Best score: <b id="best-score">—</b></div>
+      <div>RUSH balance: <b id="rush-balance">—</b></div>
+      <div>ER endpoint: <b id="er-endpoint">—</b></div>
+      <div>Delegated: <b id="delegated-state">—</b></div>
+    </div>
+    <div class="actions">
+      <button id="btn-enter" class="btn primary big" disabled>Enter the Arena</button>
+    </div>
+    <p class="hint">Enter the Arena = create your arena PDA (once) + delegate it to
+    <code>devnet-as</code> + start round 1. One base tx for setup, then everything
+    plays gasless on the rollup.</p>
+    <div id="lobby-log" class="log"></div>
+  </section>
+
+  <!-- ============ SCREEN 2: ARENA ============ -->
+  <section id="screen-arena" class="screen">
+    <div class="arena-top">
+      <div class="timer">⏱ <span id="timer">30.0</span>s</div>
+      <div class="score">SCORE <span id="score">0</span></div>
+      <div class="er-badge">⚡ 10 ms blocks · gasless</div>
+    </div>
+    <div id="tap-area">
+      <div id="target" class="target hidden">🎯</div>
+      <div id="tap-feedback"></div>
+    </div>
+    <div class="arena-bottom">
+      <span>Confirmed taps: <b id="confirmed-taps">0</b></span>
+      <span>Pending: <b id="pending-taps">0</b></span>
+      <span>Round: <b id="round-nonce">—</b></span>
+    </div>
+  </section>
+
+  <!-- ============ SCREEN 3: LOOT CHEST ============ -->
+  <section id="screen-chest" class="screen">
+    <h1 id="chest-title">🎲 Rolling verifiable randomness…</h1>
+    <p id="chest-sub" class="lede">The VRF oracle is proving your loot multiplier on-chain.
+    This takes a few seconds.</p>
+    <div id="chest" class="chest">📦</div>
+    <div id="chest-result" class="hidden">
+      <div id="chest-tier" class="tier"></div>
+      <div id="chest-math" class="math"></div>
+    </div>
+    <div class="actions">
+      <button id="btn-force-expire" class="btn ghost hidden">Stuck over 130 s? Resolve as Common ×1</button>
+    </div>
+    <div id="chest-log" class="log"></div>
+  </section>
+
+  <!-- ============ SCREEN 4: RESULTS ============ -->
+  <section id="screen-results" class="screen">
+    <h1>🏆 Round complete!</h1>
+    <div class="result-grid">
+      <div>Final score: <b id="res-score">—</b></div>
+      <div>Loot multiplier: <b id="res-mult">—</b></div>
+      <div>RUSH won: <b id="res-rush">—</b></div>
+      <div>Best score: <b id="res-best">—</b></div>
+    </div>
+    <h2>Verify on-chain (devnet explorer)</h2>
+    <ul id="proof-links" class="proof"></ul>
+    <div class="actions">
+      <button id="btn-again" class="btn primary big">Play again (re-delegate)</button>
+      <button id="btn-lobby" class="btn ghost">Back to lobby</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>Arena Rush · Solana Blitz v10 · program
+  <code>HDAvFeo4tpoGzmZqvAhRzmYVdF1qi4CCJxQNZjhQj9D2</code> (devnet) ·
+  <a href="https://github.com/arefki" target="_blank" rel="noopener">github.com/arefki</a></p>
+  <p class="fine">Devnet only. RUSH is a worthless devnet demo token. No real money, no mainnet.</p>
+</footer>
+
+<script src="./app.js"></script>
+</body>
+</html>
