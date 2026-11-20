@@ -114,10 +114,10 @@ Arena PDA: **94 bytes** — far under the 10,240-byte commit limit. Commits per 
 
 ### Play the game (devnet)
 
-The program is **live on devnet**. The hosted demo link goes live once the GitHub repo is created and Pages is enabled.
+The program is **live on devnet**.
 
-- **Live demo (pending Pages):** `https://arefki.github.io/arena-rush/` — *repo + Pages setup in progress; the site in `docs/` is ready to serve*
-- **Demo video (pending):** *link to be added after recording*
+- **Live demo:** https://arefki.github.io/arena-rush/
+- **Demo video:** https://www.youtube.com/watch?v=lXy6oL0YaA0 (2:51, gameplay captured live on devnet)
 
 Requirements: a Solana wallet (Phantom) on **devnet** with a little devnet SOL (faucet: https://faucet.solana.com). One round costs ~0.003 SOL session deposit + base tx fees; taps and the VRF request inside the ER are free.
 
@@ -217,9 +217,9 @@ Frontend smoke test (Playwright, headless): page renders, web3 bundle loads, are
 
 ## Links
 
-- **Repo:** https://github.com/arefki/arena-rush — *⏳ repo to be created; local repo ready to push*
-- **Live demo:** _pending deploy + GitHub Pages_
-- **Demo video:** _pending recording_
+- **Repo:** https://github.com/arefki/arena-rush
+- **Live demo:** https://arefki.github.io/arena-rush/
+- **Demo video:** https://www.youtube.com/watch?v=lXy6oL0YaA0
 - **MagicBlock docs:** https://docs.magicblock.gg
 - **Solana Blitz v10:** https://luma.com/hedv5sgh · submit at https://build.magicblock.app/?stage=blitz#submit
 
